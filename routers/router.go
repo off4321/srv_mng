@@ -10,14 +10,18 @@ import (
 // NewRouter はルーティングを設定した ServeMux を返します。
 // すべてのAPIエンドポイントをここで定義し、apiパッケージのハンドラを関連付けます。
 func NewRouter() *http.ServeMux {
+	// ルーターの作成
 	mux := http.NewServeMux()
 
-	// /status ルート
-	mux.HandleFunc("/status", api.StatusHandler)
+	// [電源制御エンドポイント] POSTリクエストでターゲットの電源操作を実行
+	mux.HandleFunc("/power/start", api.PowerHandler)
+	mux.HandleFunc("/power/stop", api.PowerHandler)
 
-	// /power/start や /power/stop ルート
-	// /power/ の後をパスとして処理するため、末尾にスラッシュを付ける
-	mux.HandleFunc("/power/", api.PowerHandler)
+	// [ステータス確認エンドポイント] GETリクエストで全ターゲットの死活確認結果を取得
+	mux.HandleFunc("/status", api.StatusHandler)
+    
+	// [ターゲット登録/更新エンドポイント] POSTリクエストで新しいターゲットをDBに登録または更新
+	mux.HandleFunc("/targets/register", api.RegisterTargetHandler)
 
 	return mux
 }

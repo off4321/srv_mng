@@ -1,142 +1,241 @@
 package service
 
 import (
-	"bufio"
 	"bytes"
+	"database/sql" 
 	"fmt"
 	"net"
-	"os"
+	"os" 
 	"os/exec"
-	"strconv"
-	"strings"
 	"time"
+
+	_ "github.com/mattn/go-sqlite3" // SQLiteドライバ
 )
 
 // ホストOSの電源制御スクリプトのパス
 const powerControlScript = "/usr/local/bin/power_control.sh"
 
-// 監視リストファイルのパス (Go APIのコンテキストルートからの相対パス)
-const MonitorListFile = "./srv_container_list/list.txt"
+// DB接続
+var db *sql.DB
 
-// MonitorTarget は list.txt から読み込まれる各監視対象の構造体です。
+// InitDB はデータベース接続を初期化します。
+// DSN (Data Source Name) は SQLite ファイルのパスを想定しています。
+func InitDB(dsn string) error {
+	var err error
+	// sqlite3 ドライバを使用
+	db, err = sql.Open("sqlite3", dsn)
+	if err != nil {
+		return fmt.Errorf("error opening database (SQLite): %w", err)
+	}
+
+	// 接続確認 (SQLiteではファイルが存在すれば成功する)
+	if err = db.Ping(); err != nil {
+		return fmt.Errorf("error pinging database (SQLite): %w", err)
+	}
+	return nil
+}
+
+// CreateInitialTables は monitor_targets テーブルが存在しない場合に作成します。
+func CreateInitialTables() error {
+	if db == nil {
+		return fmt.Errorf("database connection not initialized")
+	}
+
+	// テーブル作成クエリ
+	createTableSQL := `
+	CREATE TABLE IF NOT EXISTS monitor_targets (
+		name TEXT PRIMARY KEY,
+		type TEXT NOT NULL,
+		host_ip TEXT NOT NULL,
+		port TEXT NOT NULL,
+		mac_address TEXT,
+		ssh_user TEXT,
+		ssh_pass TEXT,
+		broadcast_ip TEXT
+	);
+	`
+	_, err := db.Exec(createTableSQL)
+	if err != nil {
+		return fmt.Errorf("failed to create monitor_targets table: %w", err)
+	}
+
+	// 初期データの挿入 (ダミーデータ。パスワードは安全のため空欄にしています)
+	insertDataSQL := `
+	INSERT OR IGNORE INTO monitor_targets 
+	(name, type, host_ip, port, mac_address, ssh_user, ssh_pass, broadcast_ip) 
+	VALUES 
+	('sample_name', 'sample_host', 'sample_ip', 'sample_port', 'sample_mac', 'sample_user', 'sample_pass', 'sample_broadcast_ip'),
+	`
+	_, err = db.Exec(insertDataSQL)
+	if err != nil {
+		return fmt.Errorf("failed to insert initial data: %w", err)
+	}
+
+	return nil
+}
+
+// SaveMonitorTarget は、ターゲット設定をDBに保存（または既存のものを更新）します。
+func SaveMonitorTarget(config *MonitorTarget) error {
+	if db == nil {
+		return fmt.Errorf("database connection not initialized")
+	}
+	if config.Name == "" || config.HostIP == "" || config.Port == "" || config.Type == "" {
+		return fmt.Errorf("name, host_ip, port, and type are required fields")
+	}
+
+	// INSERT OR REPLACE は、PRIMARY KEY(name)が衝突した場合に既存の行を削除し、新しい行を挿入します。
+	query := `
+	INSERT OR REPLACE INTO monitor_targets 
+	(name, type, host_ip, port, mac_address, ssh_user, ssh_pass, broadcast_ip) 
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`
+	_, err := db.Exec(query,
+		config.Name,
+		config.Type,
+		config.HostIP,
+		config.Port,
+		config.MacAddress,
+		config.SSHUser,
+		config.SSHPass,
+		config.BroadcastIP,
+	)
+
+	if err != nil {
+		return fmt.Errorf("failed to save target config to database: %w", err)
+	}
+
+	return nil
+}
+
+
+// MonitorTarget は monitor_targets テーブルから読み込まれる設定の構造体です。
+// power_control.sh の実行に必要な全情報を含みます。
 type MonitorTarget struct {
-	Name string
-	Host string // IPアドレスまたはホスト名
-	Port string // 死活確認に使用するポート番号
-	Type string // 対象のタイプ（"host" or "container"）
+	Name        string `json:"name"`        // DB column: name
+	Type        string `json:"type"`        // DB column: type ("host" or "container")
+	HostIP      string `json:"host_ip"`     // DB column: host_ip
+	Port        string `json:"port"`        // DB column: port (死活確認用、SSHポートやHTTPポートなど)
+	MacAddress  string `json:"mac_address"` // DB column: mac_address (WOL用, hostのみ使用)
+	SSHUser     string `json:"ssh_user"`    // DB column: ssh_user (SSH Shutdown用, hostのみ使用)
+	SSHPass     string `json:"ssh_pass"`    // DB column: ssh_pass (SSH Shutdown用, hostのみ使用)
+	BroadcastIP string `json:"broadcast_ip"`// DB column: broadcast_ip (WOL用, hostのみ使用)
 }
 
 // TargetStatus は、APIエンドポイントで返す監視対象のステータス構造体です。
-// JSONエンコーディングのためにフィールド名をエクスポート（大文字始まり）します。
 type TargetStatus struct {
-	Type string `json:"type"`
-	Name string `json:"name"`
-	HostPort string `json:"host_port"`
-	Status string `json:"status"`
+	Type     string `json:"type"`     // "host", "container"
+	Name     string `json:"name"`     // ターゲット名
+	HostPort string `json:"host_port"`// IP:Port
+	Status   string `json:"status"`   // "Running", "Stopped/Unreachable", "Unknown"
+}
+
+
+// GetTargetConfig は指定されたターゲットの設定をDBから取得し、パスワードを環境変数から補完します。
+func GetTargetConfig(targetName string) (*MonitorTarget, error) {
+	if db == nil {
+		return nil, fmt.Errorf("database connection not initialized")
+	}
+
+	// DBから全フィールドを選択
+	query := "SELECT name, type, host_ip, port, mac_address, ssh_user, ssh_pass, broadcast_ip FROM monitor_targets WHERE name = ?"
+	
+	config := &MonitorTarget{}
+	err := db.QueryRow(query, targetName).Scan(
+		&config.Name, 
+		&config.Type, 
+		&config.HostIP, 
+		&config.Port, 
+		&config.MacAddress, 
+		&config.SSHUser, 
+		&config.SSHPass, 
+		&config.BroadcastIP,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("target '%s' not found in database", targetName)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("database query error: %w", err)
+	}
+    
+	return config, nil
+}
+
+// GetAllTargetsFromDB はすべてのターゲットの設定をDBから取得します。
+func GetAllTargetsFromDB() ([]MonitorTarget, error) {
+	if db == nil {
+		return nil, fmt.Errorf("database connection not initialized")
+	}
+
+	query := "SELECT name, type, host_ip, port, mac_address, ssh_user, ssh_pass, broadcast_ip FROM monitor_targets"
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("database query error: %w", err)
+	}
+	defer rows.Close()
+
+	var targets []MonitorTarget
+	for rows.Next() {
+		config := MonitorTarget{}
+		err := rows.Scan(
+			&config.Name, 
+			&config.Type, 
+			&config.HostIP, 
+			&config.Port, 
+			&config.MacAddress, 
+			&config.SSHUser, 
+			&config.SSHPass, 
+			&config.BroadcastIP,
+		)
+		if err != nil {
+			// DBスキーマと構造体が一致しない、またはデータエラー
+			return nil, fmt.Errorf("error scanning row from database: %w", err)
+		}
+		targets = append(targets, config)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating over database rows: %w", err)
+	}
+
+	if len(targets) == 0 {
+		// データがない場合もエラーとして扱う
+		return nil, fmt.Errorf("no monitoring targets found in database")
+	}
+
+	return targets, nil
 }
 
 // ExecutePowerScript は、すべての電源ON/OFF操作を外部スクリプトに委譲するサービスロジックです。
-func ExecutePowerScript(action, targetName string) (string, error) {
+func ExecutePowerScript(action string, config *MonitorTarget) (string, error) {
 	if _, err := os.Stat(powerControlScript); os.IsNotExist(err) {
 		return "", fmt.Errorf("error: Power control script not found at %s", powerControlScript)
 	}
 
-	// スクリプトを実行 (例: /usr/local/bin/power_control.sh start gpu_server)
-	cmd := exec.Command(powerControlScript, action, targetName)
+	// power_control.sh の引数: 
+	// $1: action, $2: targetName, $3: IP_ADDR, $4: MAC_ADDR, $5: SSH_USER, $6: SSH_PASS, $7: BROADCAST_IP
+	args := []string{
+		action,
+		config.Name,
+		config.HostIP,
+		config.MacAddress,
+		config.SSHUser,
+		config.SSHPass,
+		config.BroadcastIP,
+	}
+
+	cmd := exec.Command(powerControlScript, args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
 		errorMsg := fmt.Sprintf("Script failed: %v. Stderr: %s", err, stderr.String())
+		// stderrをAPI応答のScriptOutputとして返すため、ここではstderr.String()も返す
 		return stderr.String(), fmt.Errorf(errorMsg)
 	}
 
 	return stdout.String(), nil
-}
-
-// LoadMonitorTargets は list.txt ファイルを読み込み、監視対象のリストを返します。
-// ファイル形式: セクションヘッダー (# hosts, # containers) と Name:Value
-func LoadMonitorTargets() ([]MonitorTarget, error) {
-	file, err := os.Open(MonitorListFile)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open monitor list file: %w", err)
-	}
-	defer file.Close()
-
-	var targets []MonitorTarget
-	scanner := bufio.NewScanner(file)
-	currentType := "" // "host" or "container"
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-
-		// セクションヘッダーを先にチェックし、処理を継続
-		if strings.HasPrefix(line, "# hosts") {
-			currentType = "host"
-			continue // 設定したら次の行へ
-		} else if strings.HasPrefix(line, "# containers") {
-			currentType = "container"
-			continue // 設定したら次の行へ
-		}
-
-		// 通常のコメント（# で始まり、セクションヘッダーではないもの）や空行をスキップ
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		// 値の解析 (Name:Value 形式を想定)
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) != 2 {
-			continue // 無効な行はスキップ
-		}
-
-		name := strings.TrimSpace(parts[0])
-		value := strings.TrimSpace(parts[1])
-
-		if name == "" || value == "" || currentType == "" {
-			continue
-		}
-
-		newTarget := MonitorTarget{
-			Name: name,
-			Type: currentType,
-		}
-
-		if currentType == "host" {
-			// ホストの場合: Name:IP (ポートはSSHの22をデフォルトとする)
-			newTarget.Host = value
-			newTarget.Port = "22"
-		} else if currentType == "container" {
-			// コンテナの場合: Name:IP:Port の形式を解析
-			ipPortParts := strings.SplitN(value, ":", 2)
-			if len(ipPortParts) != 2 {
-				// IP:Port 形式でない場合はスキップ
-				continue
-			}
-			newTarget.Host = strings.TrimSpace(ipPortParts[0])
-			newTarget.Port = strings.TrimSpace(ipPortParts[1])
-
-			// ポート番号が数値であることを確認
-			if _, err := strconv.Atoi(newTarget.Port); err != nil {
-				continue
-			}
-		} else {
-			continue
-		}
-
-		targets = append(targets, newTarget)
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("error reading monitor list file: %w", err)
-	}
-
-	if len(targets) == 0 {
-		return nil, fmt.Errorf("no valid monitoring targets found in %s", MonitorListFile)
-	}
-
-	return targets, nil
 }
 
 // CheckServiceStatus は、指定されたホストとポートへのTCP接続を試み、死活確認を行います。
@@ -152,21 +251,23 @@ func CheckServiceStatus(host, port string) string {
 	return "Running"
 }
 
-// GetAllTargetsStatus は、監視対象リストを読み込み、それぞれの死活確認結果を返します。
+// GetAllTargetsStatus は、DBからターゲットリストを読み込み、それぞれの死活確認結果を返します。
 func GetAllTargetsStatus() ([]TargetStatus, error) {
-	targets, err := LoadMonitorTargets()
+	// ターゲットリストをDBから取得
+	targets, err := GetAllTargetsFromDB()
 	if err != nil {
 		return nil, err
 	}
 
 	var results []TargetStatus
 	for _, target := range targets {
-		status := CheckServiceStatus(target.Host, target.Port)
-
+		// ホストIPとポートを使って死活確認
+		status := CheckServiceStatus(target.HostIP, target.Port)
+		
 		results = append(results, TargetStatus{
-			Type:  target.Type,
+			Type: target.Type,
 			Name: target.Name,
-			HostPort: fmt.Sprintf("%s:%s", target.Host, target.Port),
+			HostPort: fmt.Sprintf("%s:%s", target.HostIP, target.Port),
 			Status: status,
 		})
 	}

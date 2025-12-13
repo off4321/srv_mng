@@ -1,7 +1,0 @@
-# hosts
-gpu_server:172.16.100.201
-minipc3:172.16.100.103
-minipc1:172.16.100.100
-
-# containers
-reverse_proxy:172.16.100.102:80
