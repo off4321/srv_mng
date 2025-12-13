@@ -1,33 +1,36 @@
 #!/bin/bash
 
 # ────────────────────────
-#  --- 設定 ---
+# --- 実行パラメータの取得 ---
 # ────────────────────────
-# ホスト名、IPアドレス、MACアドレス、SSHユーザーを連想配列で定義
-declare -A HOSTS
-HOSTS["gpu_server,ip"]="172.16.100.201"
-HOSTS["gpu_server,mac"]="9c:6b:00:7b:67:24"
-HOSTS["minipc3,ip"]="172.16.100.103"
-HOSTS["minipc3,mac"]="c8:ff:bf:04:0e:0d"
-HOSTS["minipc1,ip"]="172.16.100.100"
-HOSTS["minipc1,mac"]="68:1d:ef:49:c1:01"
-SSH_USER="h-jun"          # 各ホストにSSH接続する際のユーザー名
-SSH_PASS="hjnk1201"
-BROADCAST="172.16.100.255"
+# このスクリプトはGo APIから以下の7つの引数を受け取ることを想定しています:
+# $1: ACTION (start または stop)
+# $2: TARGET_NAME (gpu_serverなど)
+# $3: IP_ADDR
+# $4: MAC_ADDR
+# $5: SSH_USER
+# $6: SSH_PASS
+# $7: BROADCAST_IP
+
+ACTION=$1
+TARGET_NAME=$2
+IP_ADDR=$3
+MAC_ADDR=$4
+SSH_USER=$5
+SSH_PASS=$6
+BROADCAST_IP=$7
 
 # ────────────────────────
-#  --- 関数定義 ---
+# --- 関数定義 ---
 # ────────────────────────
 usage() {
-  echo "Usage: $0 {start|stop} {gpu_server|minipc3|minipc1|all}"
-  echo "  - start: Wake On LANで電源を起動します"
-  echo "  - stop:  SSH経由でシャットダウンします"
+  echo "Usage: $0 {start|stop} {host_name} {ip} {mac} {user} {pass} {broadcast_ip}"
   exit 1
 }
 
 log_error() {
   # 赤字でエラーを表示
-  echo -e "\e[1;31m[*]\e[0m $1"
+  echo -e "\e[1;31m[*]\e[0m $1" >&2
 }
 
 log_warning() {
@@ -57,40 +60,47 @@ ping_host() {
 }
 
 start_host() {
-  local host_name=$1
-  local mac_addr=${HOSTS["$host_name,mac"]}
-
+  # グローバル変数から設定を取得
+  local host_name=$TARGET_NAME
+  local mac_addr=$MAC_ADDR
+  local ip_addr=$IP_ADDR
+  local broadcast=$BROADCAST_IP
+  
   if [ -z "$mac_addr" ]; then
-    log_error "エラー: ホスト '$host_name' のMACアドレスが定義されていません。"
-    return
+    log_error "エラー: ホスト '$host_name' のMACアドレスが設定されていません。"
+    return 1
   fi
 
   log_info "[$host_name] を起動します (MAC: $mac_addr)..."
 
-  # ホストが到達できるかを確認 (IPが無ければスキップ)
-  local ip_addr=${HOSTS["$host_name,ip"]}
+  # ホストが到達できるかを確認
   if [ -n "$ip_addr" ]; then
     if ping_host "$ip_addr"; then
       log_success "[$host_name] はすでに到達可能です。Wake‑On‑LAN はスキップします。"
-      return
+      return 0
     fi
   fi
 
   # ここから Wake‑On‑LAN 送信
-  if ! wakeonlan -i "$BROADCAST" "$mac_addr"; then
+  if ! wakeonlan -i "$broadcast" "$mac_addr"; then
     log_error "[$host_name] の Wake‑On‑LAN 送信に失敗しました。"
+    return 1
   else
     log_success "[$host_name] の Wake‑On‑LAN 送信が完了しました。"
+    return 0
   fi
 }
 
 stop_host() {
-  local host_name=$1
-  local ip_addr=${HOSTS["$host_name,ip"]}
+  # グローバル変数から設定を取得
+  local host_name=$TARGET_NAME
+  local ip_addr=$IP_ADDR
+  local ssh_user=$SSH_USER
+  local ssh_pass=$SSH_PASS
 
   if [ -z "$ip_addr" ]; then
-    log_error "エラー: ホスト '$host_name' のIPアドレスが定義されていません。"
-    return
+    log_error "エラー: ホスト '$host_name' のIPアドレスが設定されていません。"
+    return 1
   fi
 
   log_info "[$host_name] ($ip_addr) をシャットダウンします..."
@@ -98,21 +108,24 @@ stop_host() {
   # 到達確認
   if ! ping_host "$ip_addr"; then
     log_warning "[$host_name] は到達できません。シャットダウンはスキップします。"
-    return
+    return 0 # 停止状態であれば成功とみなす
   fi
 
   # expect を使って自動ログイン ＆ パスワード入力
   expect <<EOF
 set timeout 10
-spawn ssh ${SSH_USER}@${ip_addr} "sudo shutdown -h now"
+spawn ssh ${ssh_user}@${ip_addr} "sudo shutdown -h now"
 expect {
   "(yes/no" {
-     send "yes\r"
-     exp_continue
+    send "yes\r"
+    exp_continue
   }
   "password:" {
-     send "$SSH_PASS\r"
-     exp_continue
+    send "$ssh_pass\r"
+    exp_continue
+  }
+  timeout {
+    exit 1
   }
 }
 EOF
@@ -121,46 +134,34 @@ EOF
 
   if [ $ret -eq 0 ]; then
     log_info "[$host_name] へのシャットダウンコマンド投入完了"
+    return 0
   else
-    log_error "[$host_name] はシャットダウン投入できませんでした。"
+    log_error "[$host_name] はシャットダウン投入できませんでした。(Expect終了コード: $ret)"
+    return 1
   fi
 }
 
 # ────────────────────────
-#  --- メイン処理 ---
+# --- メイン処理 ---
 # ────────────────────────
-# 引数のチェック
-if [ "$#" -ne 2 ]; then
-  usage
+# 引数のチェック (Go APIからの引数は7個を想定: action, name, ip, mac, user, pass, broadcast)
+if [ "$#" -ne 7 ]; then
+	log_error "内部エラー: Go APIから予期しない数の引数が渡されました ($#個)。(期待される引数は7個です: action name ip mac user pass broadcast)"
+	exit 1
 fi
-
-ACTION=$1
-TARGET=$2
-HOST_LIST=("gpu_server" "minipc3" "minipc1")
 
 case $ACTION in
   start)
-    if [ "$TARGET" == "all" ]; then
-      for host in "${HOST_LIST[@]}"; do
-        start_host "$host"
-      done
-    else
-      start_host "$TARGET"
-    fi
+    start_host
     ;;
   stop)
-    if [ "$TARGET" == "all" ]; then
-      for host in "${HOST_LIST[@]}"; do
-        stop_host "$host"
-      done
-    else
-      stop_host "$TARGET"
-    fi
+    stop_host
     ;;
   *)
-    usage
+    log_error "不正なアクション: $ACTION"
+    exit 1
     ;;
 esac
 
-log_success "処理が完了しました。"
-
+# 処理完了メッセージはGo API側で出力するためここでは省略
+exit $?

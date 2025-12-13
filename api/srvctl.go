@@ -43,34 +43,36 @@ func PowerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ターゲットの存在確認
-	targets, err := service.LoadMonitorTargets()
+	// ターゲットの設定情報をDBから取得
+	// service.GetTargetConfig() は DB から targetName に一致するレコードを検索します
+	config, err := service.GetTargetConfig(targetName)
 	if err != nil {
-		utils.WriteJSON(w, http.StatusInternalServerError, utils.JSONResponse{Status: "error", Message: fmt.Sprintf("Configuration loading failed: %s", err.Error())})
+		// DB接続エラー、またはターゲットが見つからない場合
+		utils.WriteJSON(w, http.StatusBadRequest, utils.JSONResponse{
+			Status: "error", 
+			Message: fmt.Sprintf("Target configuration fetch failed: %s", err.Error()),
+		})
 		return
 	}
-
-	targetFound := false
-	for _, t := range targets {
-		if t.Name == targetName {
-			targetFound = true
-			break
-		}
-	}
-
-	if !targetFound {
-		utils.WriteJSON(w, http.StatusBadRequest, utils.JSONResponse{Status: "error", Message: fmt.Sprintf("Target '%s' not found in monitor list for power control.", targetName)})
+	
+	// ホストターゲット（IP/MAC/User/Passが必要なもの）か確認
+	if config.Type != "host" {
+		// host 以外のタイプは電源制御の対象外とする
+		utils.WriteJSON(w, http.StatusBadRequest, utils.JSONResponse{
+			Status: "error", 
+			Message: fmt.Sprintf("Power control only supported for 'host' type targets. Target '%s' is type '%s'.", config.Name, config.Type),
+		})
 		return
 	}
 
 	// サービス層の実行
-	output, err := service.ExecutePowerScript(action, targetName)
+	output, err := service.ExecutePowerScript(action, config)
 
 	if err != nil {
 		utils.WriteJSON(w, http.StatusInternalServerError, utils.JSONResponse{
 			Status: "failure",
 			Action: action,
-			Target: targetName,
+			Target: config.Name,
 			Message: err.Error(),
 			ScriptOutput: output,
 		})
@@ -80,8 +82,8 @@ func PowerHandler(w http.ResponseWriter, r *http.Request) {
 	utils.WriteJSON(w, http.StatusOK, utils.JSONResponse{
 		Status:  "success",
 		Action:  action,
-		Target:  targetName,
-		Message: fmt.Sprintf("Power '%s' command executed for %s.", action, targetName),
+		Target:  config.Name,
+		Message: fmt.Sprintf("Power '%s' command executed for %s.", action, config.Name),
 		ScriptOutput: output,
 	})
 }
