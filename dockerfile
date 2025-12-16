@@ -2,7 +2,7 @@ FROM golang:1.25-bookworm
 
 # 開発・デバッグに必要なツールのインストール
 RUN apt update
-RUN apt install -y curl git make ethtool wakeonlan iproute2 openssh-server iputils-ping netcat-openbsd expect
+RUN apt install -y curl git make ethtool wakeonlan iproute2 openssh-server iputils-ping netcat-openbsd expect sqlite3
 
 # Goソースコードの作業ディレクトリを設定
 ENV GOPATH /go
@@ -16,6 +16,7 @@ COPY api/ api/
 COPY routers/ routers/
 COPY service/ service/
 COPY utils/ utils/
+COPY start.sh .
 
 
 # 依存関係をダウンロード
@@ -23,4 +24,7 @@ RUN go mod tidy
 
 RUN go build -o srvmng_api .
 
-CMD ["./srvmng_api"]
+# start.shに実行権限を付与
+RUN chmod +x ./start.sh
+
+CMD ["./start.sh"]

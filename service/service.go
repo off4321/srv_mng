@@ -130,7 +130,7 @@ type TargetStatus struct {
 }
 
 
-// GetTargetConfig は指定されたターゲットの設定をDBから取得し、パスワードを環境変数から補完します。
+// GetTargetConfig は指定されたターゲットの設定をDBから取得
 func GetTargetConfig(targetName string) (*MonitorTarget, error) {
 	if db == nil {
 		return nil, fmt.Errorf("database connection not initialized")
