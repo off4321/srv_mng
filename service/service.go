@@ -5,6 +5,7 @@ import (
 	"database/sql" 
 	"fmt"
 	"net"
+	"log"
 	"os" 
 	"os/exec"
 	"time"
@@ -25,13 +26,16 @@ func InitDB(dsn string) error {
 	// sqlite3 ドライバを使用
 	db, err = sql.Open("sqlite3", dsn)
 	if err != nil {
+		log.Printf("[ERROR] Failed to open database: %v", err)
 		return fmt.Errorf("error opening database (SQLite): %w", err)
 	}
 
 	// 接続確認 (SQLiteではファイルが存在すれば成功する)
 	if err = db.Ping(); err != nil {
+		log.Printf("[ERROR] Database ping failed: %v", err)
 		return fmt.Errorf("error pinging database (SQLite): %w", err)
 	}
+	log.Printf("[INFO] Database connection initialized successfully (DSN: %s)", dsn)
 	return nil
 }
 
@@ -77,9 +81,11 @@ func CreateInitialTables() error {
 // SaveMonitorTarget は、ターゲット設定をDBに保存（または既存のものを更新）します。
 func SaveMonitorTarget(config *MonitorTarget) error {
 	if db == nil {
+		log.Printf("[ERROR] database connection not initialized")
 		return fmt.Errorf("database connection not initialized")
 	}
 	if config.Name == "" || config.HostIP == "" || config.Port == "" || config.Type == "" {
+		log.Printf("[ERROR] name, host_ip, port, and type are required fields Name:'%s', HostIP:'%s', Port:'%s', Type:'%s'", config.Name, config.HostIP, config.Port, config.Type)
 		return fmt.Errorf("name, host_ip, port, and type are required fields")
 	}
 
@@ -101,9 +107,11 @@ func SaveMonitorTarget(config *MonitorTarget) error {
 	)
 
 	if err != nil {
+		log.Printf("[ERROR] Failed to save target '%s': %v", config.Name, err)
 		return fmt.Errorf("failed to save target config to database: %w", err)
 	}
 
+	log.Printf("[INFO] Target saved/updated: %s (%s)", config.Name, config.HostIP)
 	return nil
 }
 
@@ -152,12 +160,14 @@ func GetTargetConfig(targetName string) (*MonitorTarget, error) {
 	)
 
 	if err == sql.ErrNoRows {
+		log.Printf("[ERROR] target '%s' not found in database", targetName)
 		return nil, fmt.Errorf("target '%s' not found in database", targetName)
 	}
 	if err != nil {
+		log.Printf("[ERROR] database query error: %w", err)
 		return nil, fmt.Errorf("database query error: %w", err)
 	}
-    
+    log.Printf("[SUCCESS] GetTarget query succeed")
 	return config, nil
 }
 
@@ -170,6 +180,7 @@ func GetAllTargetsFromDB() ([]MonitorTarget, error) {
 	query := "SELECT name, type, host_ip, port, mac_address, ssh_user, ssh_pass, broadcast_ip FROM monitor_targets"
 	rows, err := db.Query(query)
 	if err != nil {
+		log.Printf("[ERROR] database query error: %w", err)
 		return nil, fmt.Errorf("database query error: %w", err)
 	}
 	defer rows.Close()
@@ -189,26 +200,31 @@ func GetAllTargetsFromDB() ([]MonitorTarget, error) {
 		)
 		if err != nil {
 			// DBスキーマと構造体が一致しない、またはデータエラー
+			log.Printf("[ERROR] error scanning row from database: %w", err)
 			return nil, fmt.Errorf("error scanning row from database: %w", err)
 		}
 		targets = append(targets, config)
 	}
 
 	if err = rows.Err(); err != nil {
+		log.Printf("[ERROR] error iterating over database rows: %w", err)
 		return nil, fmt.Errorf("error iterating over database rows: %w", err)
 	}
 
 	if len(targets) == 0 {
 		// データがない場合もエラーとして扱う
+		log.Printf("[ERROR] no monitoring targets found in database")
 		return nil, fmt.Errorf("no monitoring targets found in database")
 	}
-
+	log.Printf("[INFO] GetALLTarget query succeed")
 	return targets, nil
 }
 
 // ExecutePowerScript は、すべての電源ON/OFF操作を外部スクリプトに委譲するサービスロジックです。
 func ExecutePowerScript(action string, config *MonitorTarget) (string, error) {
+	log.Printf("[INFO] Executing power action '%s' for target '%s'...", action, config.Name)
 	if _, err := os.Stat(powerControlScript); os.IsNotExist(err) {
+		log.Printf("[ERROR] Script not found: %s", powerControlScript)
 		return "", fmt.Errorf("error: Power control script not found at %s", powerControlScript)
 	}
 
@@ -232,9 +248,10 @@ func ExecutePowerScript(action string, config *MonitorTarget) (string, error) {
 	if err := cmd.Run(); err != nil {
 		errorMsg := fmt.Sprintf("Script failed: %v. Stderr: %s", err, stderr.String())
 		// stderrをAPI応答のScriptOutputとして返すため、ここではstderr.String()も返す
+		log.Printf("[ERROR] Action '%s' failed for '%s'. Stderr: %s, Error: %v", action, config.Name, stderr.String(), err)
 		return stderr.String(), fmt.Errorf(errorMsg)
 	}
-
+	log.Printf("[INFO] Action '%s' completed for '%s'. Output: %s", action, config.Name, stdout.String())
 	return stdout.String(), nil
 }
 
@@ -245,9 +262,11 @@ func CheckServiceStatus(host, port string) string {
 	// TCPポートチェック (タイムアウト: 2秒)
 	conn, err := net.DialTimeout("tcp", address, 2*time.Second)
 	if err != nil {
+		log.Printf("[INFO] Health check: %s is Down", address)
 		return "Stopped/Unreachable"
 	}
 	conn.Close()
+	log.Printf("[INFO] Health check: %s is Up", address)
 	return "Running"
 }
 
