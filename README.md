@@ -11,7 +11,7 @@ APIを叩いたときにサーバに対して指定ポートでの死活監視�
 #### power_agentの起動
 ```bash
 # dockerコンテナ内にpower_agentが作成されるのでそれを対象サーバに入れる
-docker cp srvmng_api_branch:/go/src/srvmng_ap/power_agent .
+docker cp srvmng_api_branch:/go/src/srvmng_api/power_agent .
 scp -p power_agent xxx.xxx.xxx.xxx:/your/directory
 
 # 起動
