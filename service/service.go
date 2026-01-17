@@ -2,19 +2,45 @@ package service
 
 import (
 	"bytes"
-	"database/sql" 
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
-	"net"
 	"log"
-	"os" 
-	"os/exec"
+	"net"
+	"net/http"
+	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3" // SQLiteドライバ
 )
 
-// ホストOSの電源制御スクリプトのパス
-const powerControlScript = "/usr/local/bin/power_control.sh"
+// 型 START===========================================================START
+
+// MonitorTarget は monitor_targets テーブルから読み込まれる設定の構造体です。
+// power_control.sh の実行に必要な全情報を含みます。
+type MonitorTarget struct {
+	Name        string `json:"name"`         // DB column: name
+	Type        string `json:"type"`         // DB column: type ("host" or "container")
+	HostIP      string `json:"host_ip"`      // DB column: host_ip
+	Port        string `json:"port"`         // DB column: port (死活確認用、SSHポートやHTTPポートなど)
+	MacAddress  string `json:"mac_address"`  // DB column: mac_address (WOL用, hostのみ使用)
+	SSHUser     string `json:"ssh_user"`     // DB column: ssh_user (SSH Shutdown用, hostのみ使用)
+	SSHPass     string `json:"ssh_pass"`     // DB column: ssh_pass (SSH Shutdown用, hostのみ使用)
+	BroadcastIP string `json:"broadcast_ip"` // DB column: broadcast_ip (WOL用, hostのみ使用)
+}
+
+// TargetStatus は、APIエンドポイントで返す監視対象のステータス構造体です。
+type TargetStatus struct {
+	Type     string `json:"type"`      // "host", "container"
+	Name     string `json:"name"`      // ターゲット名
+	HostPort string `json:"host_port"` // IP:Port
+	Status   string `json:"status"`    // "Running", "Stopped/Unreachable", "Unknown"
+}
+
+// 型 END===========================================================END
+
+// DB系 START===========================================================START
 
 // DB接続
 var db *sql.DB
@@ -115,29 +141,6 @@ func SaveMonitorTarget(config *MonitorTarget) error {
 	return nil
 }
 
-
-// MonitorTarget は monitor_targets テーブルから読み込まれる設定の構造体です。
-// power_control.sh の実行に必要な全情報を含みます。
-type MonitorTarget struct {
-	Name        string `json:"name"`        // DB column: name
-	Type        string `json:"type"`        // DB column: type ("host" or "container")
-	HostIP      string `json:"host_ip"`     // DB column: host_ip
-	Port        string `json:"port"`        // DB column: port (死活確認用、SSHポートやHTTPポートなど)
-	MacAddress  string `json:"mac_address"` // DB column: mac_address (WOL用, hostのみ使用)
-	SSHUser     string `json:"ssh_user"`    // DB column: ssh_user (SSH Shutdown用, hostのみ使用)
-	SSHPass     string `json:"ssh_pass"`    // DB column: ssh_pass (SSH Shutdown用, hostのみ使用)
-	BroadcastIP string `json:"broadcast_ip"`// DB column: broadcast_ip (WOL用, hostのみ使用)
-}
-
-// TargetStatus は、APIエンドポイントで返す監視対象のステータス構造体です。
-type TargetStatus struct {
-	Type     string `json:"type"`     // "host", "container"
-	Name     string `json:"name"`     // ターゲット名
-	HostPort string `json:"host_port"`// IP:Port
-	Status   string `json:"status"`   // "Running", "Stopped/Unreachable", "Unknown"
-}
-
-
 // GetTargetConfig は指定されたターゲットの設定をDBから取得
 func GetTargetConfig(targetName string) (*MonitorTarget, error) {
 	if db == nil {
@@ -146,16 +149,16 @@ func GetTargetConfig(targetName string) (*MonitorTarget, error) {
 
 	// DBから全フィールドを選択
 	query := "SELECT name, type, host_ip, port, mac_address, ssh_user, ssh_pass, broadcast_ip FROM monitor_targets WHERE name = ?"
-	
+
 	config := &MonitorTarget{}
 	err := db.QueryRow(query, targetName).Scan(
-		&config.Name, 
-		&config.Type, 
-		&config.HostIP, 
-		&config.Port, 
-		&config.MacAddress, 
-		&config.SSHUser, 
-		&config.SSHPass, 
+		&config.Name,
+		&config.Type,
+		&config.HostIP,
+		&config.Port,
+		&config.MacAddress,
+		&config.SSHUser,
+		&config.SSHPass,
 		&config.BroadcastIP,
 	)
 
@@ -167,7 +170,7 @@ func GetTargetConfig(targetName string) (*MonitorTarget, error) {
 		log.Printf("[ERROR] database query error: %w", err)
 		return nil, fmt.Errorf("database query error: %w", err)
 	}
-    log.Printf("[SUCCESS] GetTarget query succeed")
+	log.Printf("[SUCCESS] GetTarget query succeed")
 	return config, nil
 }
 
@@ -189,13 +192,13 @@ func GetAllTargetsFromDB() ([]MonitorTarget, error) {
 	for rows.Next() {
 		config := MonitorTarget{}
 		err := rows.Scan(
-			&config.Name, 
-			&config.Type, 
-			&config.HostIP, 
-			&config.Port, 
-			&config.MacAddress, 
-			&config.SSHUser, 
-			&config.SSHPass, 
+			&config.Name,
+			&config.Type,
+			&config.HostIP,
+			&config.Port,
+			&config.MacAddress,
+			&config.SSHUser,
+			&config.SSHPass,
 			&config.BroadcastIP,
 		)
 		if err != nil {
@@ -220,54 +223,159 @@ func GetAllTargetsFromDB() ([]MonitorTarget, error) {
 	return targets, nil
 }
 
-// ExecutePowerScript は、すべての電源ON/OFF操作を外部スクリプトに委譲するサービスロジックです。
+// DB系 END===========================================================END
+
+// 電源操作 START===========================================================START
+
+// ExecutePowerScript は、すべての電源ON/OFF操作を行うサービスロジックです。
+// Goコードで直接WOLパケットを送信し、エージェント経由でシャットダウンを実行します。
 func ExecutePowerScript(action string, config *MonitorTarget) (string, error) {
 	log.Printf("[INFO] Executing power action '%s' for target '%s'...", action, config.Name)
-	if _, err := os.Stat(powerControlScript); os.IsNotExist(err) {
-		log.Printf("[ERROR] Script not found: %s", powerControlScript)
-		return "", fmt.Errorf("error: Power control script not found at %s", powerControlScript)
-	}
 
-	// power_control.sh の引数: 
-	// $1: action, $2: targetName, $3: IP_ADDR, $4: MAC_ADDR, $5: SSH_USER, $6: SSH_PASS, $7: BROADCAST_IP
-	args := []string{
-		action,
-		config.Name,
-		config.HostIP,
-		config.MacAddress,
-		config.SSHUser,
-		config.SSHPass,
-		config.BroadcastIP,
+	switch action {
+	case "start":
+		// WOLパケットを直接送信
+		return sendWOLPacket(config.MacAddress, config.BroadcastIP, config.Name)
+		
+	case "stop":
+		// エージェント経由でシャットダウン
+		return shutdownViaAgent(config)
+	default:
+		return "", fmt.Errorf("unsupported action: %s", action)
 	}
-
-	cmd := exec.Command(powerControlScript, args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		errorMsg := fmt.Sprintf("Script failed: %v. Stderr: %s", err, stderr.String())
-		// stderrをAPI応答のScriptOutputとして返すため、ここではstderr.String()も返す
-		log.Printf("[ERROR] Action '%s' failed for '%s'. Stderr: %s, Error: %v", action, config.Name, stderr.String(), err)
-		return stderr.String(), fmt.Errorf(errorMsg)
-	}
-	log.Printf("[INFO] Action '%s' completed for '%s'. Output: %s", action, config.Name, stdout.String())
-	return stdout.String(), nil
 }
 
-// CheckServiceStatus は、指定されたホストとポートへのTCP接続を試み、死活確認を行います。
-func CheckServiceStatus(host, port string) string {
-	address := fmt.Sprintf("%s:%s", host, port)
-
-	// TCPポートチェック (タイムアウト: 2秒)
-	conn, err := net.DialTimeout("tcp", address, 2*time.Second)
+// sendWOLPacket は、指定されたMACアドレスにWOLパケットを送信します。
+func sendWOLPacket(macAddress string, broadcastIP string, Name string) (string, error) {
+	// MACアドレスをバイト配列に変換
+	macBytes, err := parseMAC(macAddress)
 	if err != nil {
-		log.Printf("[INFO] Health check: %s is Down", address)
+		log.Printf("[ERROR] invalid MAC address: %v", err)
+		return "", fmt.Errorf("invalid MAC address: %v", err)
+	}
+
+	// WOLパケットを構築
+	pkt := buildWOLPacket(macBytes)
+
+	// ブロードキャストアドレスに送信
+	broadcastIP = broadcastIP + ":9"
+	conn, err := net.Dial("udp", broadcastIP)
+	if err != nil {
+		log.Printf("[ERROR] failed to create UDP connection: %v", err)
+		return "", fmt.Errorf("failed to create UDP connection: %v", err)
+	}
+	defer conn.Close()
+
+	// WOLパケットを送信
+	_, err = conn.Write(pkt)
+	if err != nil {
+		log.Printf("[ERROR] failed to send WOL packet: %v", err)
+		return "", fmt.Errorf("failed to send WOL packet: %v", err)
+	}
+	log.Printf("[INFO] send WOL packet succeessfuly: %s", Name)
+	return "WOL packet sent successfully", nil
+}
+
+// parseMAC はMACアドレス文字列をバイト配列に変換します。
+func parseMAC(mac string) ([]byte, error) {
+	// MACアドレスの形式を正規化
+	mac = strings.ReplaceAll(mac, ":", "")
+	mac = strings.ReplaceAll(mac, "-", "")
+
+	// 12文字の16進数文字列に変換
+	if len(mac) != 12 {
+		return nil, fmt.Errorf("invalid MAC address length")
+	}
+
+	// バイト配列に変換
+	macBytes, err := hex.DecodeString(mac)
+	if err != nil {
+		return nil, fmt.Errorf("invalid MAC address format: %v", err)
+	}
+
+	return macBytes, nil
+}
+
+// buildWOLPacket は、WOLパケットを構築します。
+func buildWOLPacket(macBytes []byte) []byte {
+	// WOLパケットは、6バイトのパケットヘッダ + 16回繰り返されたMACアドレス
+	pkt := make([]byte, 0, 102)
+
+	// 6バイトのパケットヘッダ（すべて0xFF）
+	for i := 0; i < 6; i++ {
+		pkt = append(pkt, 0xFF)
+	}
+
+	// MACアドレスを16回繰り返す
+	for i := 0; i < 16; i++ {
+		pkt = append(pkt, macBytes...)
+	}
+
+	return pkt
+}
+
+// shutdownViaAgent は、エージェント経由でシャットダウンを実行します。
+func shutdownViaAgent(config *MonitorTarget) (string, error) {
+	// エージェントのAPIエンドポイントを構築
+	url := fmt.Sprintf("http://%s:%s/shutdown", config.HostIP, config.Port)
+
+	// パスワードを含むJSONボディを構築
+	body := map[string]string{
+		"password": config.SSHPass, // ここでパスワードを設定
+	}
+	jsonBody, err := json.Marshal(body)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal JSON: %v", err)
+	}
+
+	// HTTPリクエストを送信
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to shutdown via agent: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("agent shutdown returned status code: %d", resp.StatusCode)
+	}
+
+	return "Shutdown command sent via agent successfully", nil
+}
+
+// 電源操作 END===========================================================END
+
+// 死活確認 START===========================================================START
+
+// CheckServiceStatus は、指定されたホストとポートへのTCP接続を試み、死活確認を行います。
+// エージェント経由で死活確認を実行します。
+func CheckServiceStatus(host, port string) string {
+	// エージェントのAPIエンドポイントを構築
+	// 例: http://<host_ip>:<agent_port>/status
+	url := fmt.Sprintf("http://%s:%s/status", host, port)
+
+	// HTTPリクエストを送信
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		log.Printf("[INFO] Health check: %s is Down", url)
 		return "Stopped/Unreachable"
 	}
-	conn.Close()
-	log.Printf("[INFO] Health check: %s is Up", address)
-	return "Running"
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		log.Printf("[INFO] Health check: %s is Up", url)
+		return "Running"
+	}
+
+	log.Printf("[INFO] Health check: %s is Down (status code: %d)", url, resp.StatusCode)
+	return "Stopped/Unreachable"
 }
 
 // GetAllTargetsStatus は、DBからターゲットリストを読み込み、それぞれの死活確認結果を返します。
@@ -282,14 +390,16 @@ func GetAllTargetsStatus() ([]TargetStatus, error) {
 	for _, target := range targets {
 		// ホストIPとポートを使って死活確認
 		status := CheckServiceStatus(target.HostIP, target.Port)
-		
+
 		results = append(results, TargetStatus{
-			Type: target.Type,
-			Name: target.Name,
+			Type:     target.Type,
+			Name:     target.Name,
 			HostPort: fmt.Sprintf("%s:%s", target.HostIP, target.Port),
-			Status: status,
+			Status:   status,
 		})
 	}
 
 	return results, nil
 }
+
+// 死活確認 END===========================================================END
