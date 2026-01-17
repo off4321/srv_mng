@@ -4,8 +4,19 @@
 DBに登録したサーバに対して下記を実施します
 
 ### 死活監視
-APIを叩いたときにサーバに対してsshでの死活監視を行います
-**前提としてテーブルに各情報を登録する必要があります**
+APIを叩いたときにサーバに対して指定ポートでの死活監視を行います
+**前提としてテーブルに各情報を登録すること、対象サーバに`power_agent`バイナリをコピーして、実行させる必要があります**
+
+#### power_agentの起動
+```bash
+# dockerコンテナ内にpower_agentが作成されるのでそれを対象サーバに入れる
+docker cp srvmng_api_branch:/go/src/srvmng_ap/power_agent .
+scp -p power_agent xxx.xxx.xxx.xxx:/your/directory
+
+# 起動
+./power_agent <port>
+
+```
 
 #### API例
 ```bash
@@ -55,13 +66,14 @@ DBに必要情報を登録します。
 
 #### API例
 ```bash
+# portにはpower_agentで指定しているポートを入れてください。
 curl -X POST http://localhost:5001/targets/register \
      -H "Content-Type: application/json" \
      -d '{
          "name": "server",
          "type": "host",
          "host_ip": "172.16.0.xxx",
-         "port": "22",
+         "port": "<port>",
          "mac_address": "01:23:34:56:78:9a",
          "ssh_user": "user",
          "ssh_pass": "password",  
