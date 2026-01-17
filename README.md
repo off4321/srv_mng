@@ -33,8 +33,28 @@ curl -X GET http://localhost:5001/status -H "Accept: text/plain"
 SHOW SERVERS AND CONTAINERS STATUS
 TYPE     TARGET         HOST:PORT          STATUS
 ------------------------------------------------------------------------
-host        gpu_server               172.16.100.201:22        STOPPED/UNREACHABLE
+host        server               172.16.100.201:22        STOPPED/UNREACHABLE
 
+```
+### DB登録
+DBに必要情報を登録します。
+
+
+#### API例
+```bash
+# portにはpower_agentで指定しているポートを入れてください。
+curl -X POST http://localhost:5001/targets/register \
+     -H "Content-Type: application/json" \
+     -d '{
+         "name": "server",
+         "type": "host",
+         "host_ip": "172.16.0.xxx",
+         "port": "<port>",
+         "mac_address": "01:23:34:56:78:9a",
+         "ssh_user": "user",
+         "ssh_pass": "password",  
+         "broadcast_ip": "172.16.0.255"
+     }'
 ```
 
 ### WOLによる電源起動
@@ -59,23 +79,3 @@ curl -X POST http://localhost:5001/power/stop \
      -d '{"target": "server"}'
 ```
 
-### DB登録
-DBに必要情報を登録します。
-
-
-#### API例
-```bash
-# portにはpower_agentで指定しているポートを入れてください。
-curl -X POST http://localhost:5001/targets/register \
-     -H "Content-Type: application/json" \
-     -d '{
-         "name": "server",
-         "type": "host",
-         "host_ip": "172.16.0.xxx",
-         "port": "<port>",
-         "mac_address": "01:23:34:56:78:9a",
-         "ssh_user": "user",
-         "ssh_pass": "password",  
-         "broadcast_ip": "172.16.0.255"
-     }'
-```
