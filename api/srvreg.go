@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"srv_mng/service" 
+	"srv_mng/service"
 )
 
 // RegResponse はターゲット登録APIの応答構造体です。
@@ -23,10 +23,10 @@ func RegisterTargetHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// リクエストボディを service.MonitorTarget 構造体としてデコード
-	var config service.MonitorTarget 
+	var config service.MonitorTarget
 	if err := json.NewDecoder(r.Body).Decode(&config); err != nil {
 		resp := RegResponse{
-			Status: "error",
+			Status:  "error",
 			Message: fmt.Sprintf("Invalid JSON format or missing required fields: %v", err),
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -38,8 +38,8 @@ func RegisterTargetHandler(w http.ResponseWriter, r *http.Request) {
 	// 1. service層にDB保存を依頼
 	if err := service.SaveMonitorTarget(&config); err != nil {
 		resp := RegResponse{
-			Status: "failure",
-			Target: config.Name,
+			Status:  "failure",
+			Target:  config.Name,
 			Message: fmt.Sprintf("Failed to save target configuration: %v", err),
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -50,8 +50,8 @@ func RegisterTargetHandler(w http.ResponseWriter, r *http.Request) {
 
 	// 成功応答
 	resp := RegResponse{
-		Status: "success",
-		Target: config.Name,
+		Status:  "success",
+		Target:  config.Name,
 		Message: fmt.Sprintf("Target '%s' configuration successfully saved or updated.", config.Name),
 	}
 	w.Header().Set("Content-Type", "application/json")

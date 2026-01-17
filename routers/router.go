@@ -2,9 +2,9 @@ package routers
 
 import (
 	"net/http"
-	
+
 	// APIハンドラ層をインポート
-	"srv_mng/api" 
+	"srv_mng/api"
 )
 
 // NewRouter はルーティングを設定した ServeMux を返します。
@@ -19,7 +19,7 @@ func NewRouter() *http.ServeMux {
 
 	// [ステータス確認エンドポイント] GETリクエストで全ターゲットの死活確認結果を取得
 	mux.HandleFunc("/status", api.StatusHandler)
-    
+
 	// [ターゲット登録/更新エンドポイント] POSTリクエストで新しいターゲットをDBに登録または更新
 	mux.HandleFunc("/targets/register", api.RegisterTargetHandler)
 
